@@ -1,0 +1,1 @@
+"""ECOTHERM backend application."""
