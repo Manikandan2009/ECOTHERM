@@ -12,7 +12,7 @@ import pandas as pd
 import rasterio
 from pyproj import Geod
 from rasterio.warp import transform as transform_coordinates
-from shapely.geometry import Point
+from shapely.geometry import Point, box
 
 from app.services.study_areas import StudyArea
 
@@ -368,3 +368,51 @@ def write_grid_csv(frame: pd.DataFrame, output_path: Path) -> None:
                 f"could not be removed: {cleanup_error}"
             ) from exc
         raise GridProcessingError(f"Could not write grid CSV {output_path.name}: {exc}") from exc
+
+
+def write_grid_geojson(
+    frame: pd.DataFrame,
+    output_path: Path,
+    *,
+    resolution_m: int,
+) -> None:
+    if resolution_m not in (100, 1000):
+        raise ValueError("analysis resolution must be 100 m or 1000 m")
+    temporary_path = output_path.with_name(
+        f".{output_path.stem}.{uuid.uuid4().hex}.tmp.geojson"
+    )
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        projected = gpd.GeoDataFrame(
+            frame.drop(columns=["geometry"]),
+            geometry=frame.geometry,
+            crs="EPSG:4326",
+        ).to_crs("EPSG:32644")
+        half_cell = resolution_m / 2
+        polygons = [
+            box(
+                point.x - half_cell,
+                point.y - half_cell,
+                point.x + half_cell,
+                point.y + half_cell,
+            )
+            for point in projected.geometry
+        ]
+        cells = gpd.GeoDataFrame(
+            projected.drop(columns=["geometry"]),
+            geometry=polygons,
+            crs="EPSG:32644",
+        ).to_crs("EPSG:4326")
+        cells.to_file(temporary_path, driver="GeoJSON")
+        os.replace(temporary_path, output_path)
+    except (OSError, ValueError, TypeError, RuntimeError) as exc:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError as cleanup_error:
+            raise GridProcessingError(
+                f"Could not write {output_path.name}, and the temporary file "
+                f"could not be removed: {cleanup_error}"
+            ) from exc
+        raise GridProcessingError(
+            f"Could not write grid GeoJSON {output_path.name}: {exc}"
+        ) from exc

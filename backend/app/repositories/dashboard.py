@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from app.repositories.grid_exports import GridExportError, read_grid_export
 from app.schemas.dashboard import DashboardSummary
 
 
@@ -38,6 +39,21 @@ def load_dashboard_summary(
         if region_id == "tamil_nadu"
         else {}
     )
+    grid_export = None
+    if region_id in {"tamil_nadu", "chennai", "coimbatore", "madurai"}:
+        try:
+            grid_export = read_grid_export(
+                database_path.parent.parent,
+                region_id=region_id,
+                season_year=season_year,
+                resolution_m=grid_resolution_m or 1000,
+                columns=("lst_c", "population_estimated_2025"),
+            )
+        except GridExportError as exc:
+            raise DashboardRepositoryError(str(exc)) from exc
+    export_summary = (
+        _grid_export_summary(grid_export) if grid_export is not None else None
+    )
     if not database_path.is_file():
         mean, maximum, model, status, start_date, end_date = _read_cached_weather(
             database_path,
@@ -45,26 +61,55 @@ def load_dashboard_summary(
             season_year=season_year,
         )
         unavailable = [
-            "The local analysis database does not exist yet.",
             "people_exposed_high_heat",
             "high_risk_cell_count",
             "urban_heat_island_intensity",
         ]
+        if export_summary is None:
+            unavailable.insert(0, "The local analysis database does not exist yet.")
         if region_id == "tamil_nadu" and not osm_summary:
             unavailable.append("osm_features")
         return DashboardSummary(
             region_id=region_id,
             season_year=season_year,
-            data_status="partial" if mean is not None else "unavailable",
+            data_status=(
+                "available"
+                if export_summary is not None and export_summary["grid_cell_count"]
+                else "partial" if mean is not None else "unavailable"
+            ),
             grid_resolution_m=grid_resolution_m,
-            grid_cell_count=None,
-            lst_valid_cell_count=None,
-            lst_coverage_percent=None,
-            lst_mean_c=None,
-            lst_max_c=None,
-            estimated_population_2025=None,
-            population_valid_cell_count=None,
-            population_coverage_percent=None,
+            grid_cell_count=(
+                export_summary["grid_cell_count"] if export_summary else None
+            ),
+            lst_valid_cell_count=(
+                export_summary["lst_valid_cell_count"] if export_summary else None
+            ),
+            lst_coverage_percent=(
+                export_summary["lst_valid_cell_count"]
+                / export_summary["grid_cell_count"]
+                * 100
+                if export_summary and export_summary["grid_cell_count"]
+                else None
+            ),
+            lst_mean_c=export_summary["lst_mean_c"] if export_summary else None,
+            lst_max_c=export_summary["lst_max_c"] if export_summary else None,
+            estimated_population_2025=(
+                export_summary["estimated_population_2025"]
+                if export_summary
+                else None
+            ),
+            population_valid_cell_count=(
+                export_summary["population_valid_cell_count"]
+                if export_summary
+                else None
+            ),
+            population_coverage_percent=(
+                export_summary["population_valid_cell_count"]
+                / export_summary["grid_cell_count"]
+                * 100
+                if export_summary and export_summary["grid_cell_count"]
+                else None
+            ),
             weather_mean_air_temperature_c=mean,
             weather_max_air_temperature_c=maximum,
             weather_model=model,
@@ -166,6 +211,14 @@ def load_dashboard_summary(
             f"Could not read the cached dashboard database: {exc}"
         ) from exc
 
+    if export_summary is not None:
+        grid_cell_count = export_summary["grid_cell_count"]
+        lst_valid_count = export_summary["lst_valid_cell_count"]
+        lst_mean = export_summary["lst_mean_c"]
+        lst_max = export_summary["lst_max_c"]
+        population_valid_count = export_summary["population_valid_cell_count"]
+        population = export_summary["estimated_population_2025"]
+
     weather_mean = weather[0] if weather and weather[0] is not None else None
     weather_max = weather[1] if weather and weather[1] is not None else None
     weather_model = weather[2] if weather and weather[2] is not None else None
@@ -244,6 +297,28 @@ def load_dashboard_summary(
 
 class DashboardRepositoryError(RuntimeError):
     """Raised when persisted dashboard summaries cannot be read."""
+
+
+def _grid_export_summary(frame: pd.DataFrame) -> dict[str, float | int | None]:
+    lst_values = pd.to_numeric(frame["lst_c"], errors="coerce")
+    valid_lst = lst_values[np.isfinite(lst_values) & lst_values.between(0, 80)]
+    population_values = pd.to_numeric(
+        frame["population_estimated_2025"],
+        errors="coerce",
+    )
+    valid_population = population_values[
+        np.isfinite(population_values) & (population_values >= 0)
+    ]
+    return {
+        "grid_cell_count": len(frame),
+        "lst_valid_cell_count": len(valid_lst),
+        "lst_mean_c": float(valid_lst.mean()) if not valid_lst.empty else None,
+        "lst_max_c": float(valid_lst.max()) if not valid_lst.empty else None,
+        "population_valid_cell_count": len(valid_population),
+        "estimated_population_2025": (
+            float(valid_population.sum()) if not valid_population.empty else None
+        ),
+    }
 
 
 def _read_cached_osm_summary(cache_dir: Path) -> dict[str, Any]:

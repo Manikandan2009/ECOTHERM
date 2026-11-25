@@ -4,7 +4,7 @@ ECOTHERM is a software-only urban heat intelligence project for Tamil Nadu. The 
 
 ## Current milestone
 
-See [PROGRESS.md](./PROGRESS.md). Milestones 2 and 3 establish the local Python/React setup and Earth Engine/Open-Meteo clients. Raster/grid processing, ML, and the complete dashboard are separate later milestones.
+See [PROGRESS.md](./PROGRESS.md). Milestone 3 provides the Earth Engine/Open-Meteo clients; Milestone 4 includes geospatial exports and the dashboard's cached-data path. ML and later product work remain tracked separately.
 
 ## Prerequisites
 
@@ -58,6 +58,10 @@ Run the frontend from `frontend/`:
 npm run dev
 ```
 
+## Deploy
+
+The repository includes a Render Blueprint for the frontend and API. See [the deployment guide](./docs/deployment.md) for publishing the app and provisioning its cached data.
+
 ## Earth Engine authentication
 
 Earth Engine credentials are not stored in `.env` or the repository. From `backend/` with the venv active:
@@ -68,6 +72,30 @@ python -m app.cli check-earth-engine
 ```
 
 The first command launches Google's supported authentication flow. The configured project ID is `ecotherm-515613`; that project must be enabled for Earth Engine and the signed-in user must have permission to use it. If access is missing, the CLI reports the initialization error rather than returning data-shaped fallbacks.
+
+To export the April 1–June 30, 2026 products for Tamil Nadu (1 km) and Chennai, Coimbatore, and Madurai (about 100 m), run these commands from `backend/` after activating the virtual environment:
+
+```powershell
+Set-Location backend
+.\.venv\Scripts\Activate.ps1
+python -m app.cli authenticate-earth-engine
+python -m app.cli check-earth-engine
+python -m app.cli acquire-summer-data --year 2026 --region-id tamil_nadu --region-id chennai --region-id coimbatore --region-id madurai --skip-weather --skip-osm
+```
+
+The export uses Landsat 8/9 Collection 2 Level 2 ST_B10 with QA_PIXEL cloud/shadow masking, Sentinel-2 SR Harmonized with SCL masking for NDVI/NDBI, and WorldPop 2025 population estimates. Cell CSVs and polygon GeoJSONs are written to `data/cache/processed/grids/`; source rasters and manifests are kept under `data/cache/raw/earth_engine/` and `data/cache/processed/manifests/`. The statewide 1 km WorldPop values are aggregated as population counts; 100 m products do not imply finer Landsat thermal detail. The command can take a while and requires Earth Engine access.
+
+The dashboard API reads these grid CSVs for statewide/city summary and satellite metrics, falling back to SQLite when a grid CSV is absent. Its map tiles use the cached raster, and its administrative overlays use the cached boundary GeoJSON. Start the API and frontend in separate terminals:
+
+```powershell
+Set-Location backend
+uvicorn app.main:app --reload
+```
+
+```powershell
+Set-Location frontend
+npm run dev
+```
 
 Fetch and cache daily/hourly weather for a named reference point (the coordinates are explicit inputs, not assumed city averages):
 

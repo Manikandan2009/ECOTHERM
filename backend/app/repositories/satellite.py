@@ -4,6 +4,10 @@ import math
 import sqlite3
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
+
+from app.repositories.grid_exports import GridExportError, read_grid_export
 from app.schemas.satellite import (
     SatelliteAnalysisSummary,
     SatelliteMetric,
@@ -164,6 +168,31 @@ def load_satellite_summary(
     season_year: int,
     cache_dir: Path | None = None,
 ) -> SatelliteAnalysisSummary:
+    if cache_dir is not None and region_id in {
+        "tamil_nadu",
+        "chennai",
+        "coimbatore",
+        "madurai",
+    }:
+        resolution_m = 1000 if region_id == "tamil_nadu" else 100
+        try:
+            grid_export = read_grid_export(
+                cache_dir,
+                region_id=region_id,
+                season_year=season_year,
+                resolution_m=resolution_m,
+                columns=METRICS,
+            )
+        except GridExportError as exc:
+            raise SatelliteRepositoryError(str(exc)) from exc
+        if grid_export is not None:
+            return _summary_from_grid_export(
+                grid_export,
+                region_id=region_id,
+                season_year=season_year,
+                resolution_m=resolution_m,
+            )
+
     row = None
     if database_path.is_file():
         try:
@@ -214,6 +243,42 @@ def load_satellite_summary(
         data_status="available" if valid_metrics == len(METRICS) else "partial",
         grid_cell_count=cell_count,
         grid_resolution_m=int(row[1]) if row[1] is not None else None,
+        lst=metrics[0],
+        ndvi=metrics[1],
+        ndbi=metrics[2],
+        ndwi=metrics[3],
+        composite_start=f"{season_year}-04-01",
+        composite_end=f"{season_year}-06-30",
+    )
+
+
+def _summary_from_grid_export(
+    grid_export: pd.DataFrame,
+    *,
+    region_id: str,
+    season_year: int,
+    resolution_m: int,
+) -> SatelliteAnalysisSummary:
+    cell_count = len(grid_export)
+    metrics: list[SatelliteMetric] = []
+    for metric in METRICS:
+        values = pd.to_numeric(grid_export[metric], errors="coerce")
+        lower, upper = (0, 80) if metric == "lst_c" else (-1, 1)
+        valid = values[np.isfinite(values) & values.between(lower, upper)]
+        metrics.append(
+            _metric(
+                cell_count,
+                len(valid),
+                float(valid.mean()) if not valid.empty else None,
+            )
+        )
+    valid_metrics = sum(metric.valid_cell_count not in (None, 0) for metric in metrics)
+    return SatelliteAnalysisSummary(
+        region_id=region_id,
+        season_year=season_year,
+        data_status="available" if valid_metrics == len(METRICS) else "partial",
+        grid_cell_count=cell_count,
+        grid_resolution_m=resolution_m,
         lst=metrics[0],
         ndvi=metrics[1],
         ndbi=metrics[2],

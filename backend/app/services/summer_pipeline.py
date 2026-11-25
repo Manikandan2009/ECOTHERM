@@ -28,6 +28,7 @@ from app.services.grid_processing import (
     WORLDPOP_AGGREGATION_VERSION,
     raster_to_grid_records,
     write_grid_csv,
+    write_grid_geojson,
 )
 from app.services.open_meteo import (
     OpenMeteoClient,
@@ -178,7 +179,15 @@ def run_summer_pipeline(
                         )
             manifest["openstreetmap"] = osm_status
             csv_path = grid_directory / f"{region_id}_{area.resolution_m}m_{year}.csv"
+            geojson_path = (
+                grid_directory / f"{region_id}_{area.resolution_m}m_{year}.geojson"
+            )
             write_grid_csv(records, csv_path)
+            write_grid_geojson(
+                records,
+                geojson_path,
+                resolution_m=area.resolution_m,
+            )
             saved_count = save_grid_observations(database_path, records, manifest)
             manifest_directory.mkdir(parents=True, exist_ok=True)
             (manifest_directory / f"{region_id}_{year}.json").write_text(
@@ -189,6 +198,7 @@ def run_summer_pipeline(
                 "status": "available",
                 "cell_count": saved_count,
                 "csv": str(csv_path),
+                "geojson": str(geojson_path),
                 "raster": str(raster_path),
                 "manifest_id": manifest["manifest_id"],
                 "coverage": manifest["coverage"],

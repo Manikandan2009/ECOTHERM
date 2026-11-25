@@ -92,6 +92,34 @@ def test_dashboard_summary_marks_missing_sources_without_fabricating(
     assert "people_exposed_high_heat" in summary.unavailable_metrics
 
 
+def test_dashboard_summary_reads_grid_csv_without_sqlite(tmp_path) -> None:
+    grid_directory = tmp_path / "processed" / "grids"
+    grid_directory.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "region_id": ["tamil_nadu", "tamil_nadu", "tamil_nadu"],
+            "season_year": [2026, 2026, 2026],
+            "resolution_m": [1000, 1000, 1000],
+            "lst_c": [40.0, 42.0, None],
+            "population_estimated_2025": [100.0, None, 300.0],
+        }
+    ).to_csv(grid_directory / "tamil_nadu_1000m_2026.csv", index=False)
+
+    summary = load_dashboard_summary(
+        tmp_path / "processed" / "ecotherm.sqlite",
+        region_id="tamil_nadu",
+        season_year=2026,
+        grid_resolution_m=1000,
+    )
+
+    assert summary.data_status == "available"
+    assert summary.grid_cell_count == 3
+    assert summary.lst_valid_cell_count == 2
+    assert summary.lst_mean_c == 41.0
+    assert summary.estimated_population_2025 == 400.0
+    assert summary.population_valid_cell_count == 2
+
+
 def test_static_summaries_derive_coverage_from_cached_cell_counts(tmp_path) -> None:
     database_path = tmp_path / "processed" / "ecotherm.sqlite"
     cases = (

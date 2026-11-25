@@ -58,6 +58,37 @@ def test_satellite_summary_reports_cached_means_and_layer_coverage(tmp_path) -> 
     assert summary.composite_end == "2026-06-30"
 
 
+def test_satellite_summary_prefers_cached_grid_csv(tmp_path) -> None:
+    database_path = tmp_path / "processed" / "ecotherm.sqlite"
+    database_path.parent.mkdir(parents=True)
+    _create_grid_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "INSERT INTO grid_observations VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("tamil_nadu", 2026, 1000, 20.0, -0.5, -0.5, -0.5),
+        )
+    grid_directory = tmp_path / "processed" / "grids"
+    grid_directory.mkdir()
+    (grid_directory / "tamil_nadu_1000m_2026.csv").write_text(
+        "region_id,season_year,resolution_m,lst_c,ndvi,ndbi,ndwi\n"
+        "tamil_nadu,2026,1000,40,0.4,0.1,-0.2\n"
+        "tamil_nadu,2026,1000,42,0.6,, -0.4\n",
+        encoding="utf-8",
+    )
+
+    summary = load_satellite_summary(
+        database_path,
+        region_id="tamil_nadu",
+        season_year=2026,
+        cache_dir=tmp_path,
+    )
+
+    assert summary.grid_cell_count == 2
+    assert summary.lst.mean == pytest.approx(41)
+    assert summary.ndvi.mean == pytest.approx(0.5)
+    assert summary.ndbi.coverage_percent == 50
+
+
 def test_satellite_summary_keeps_missing_regions_unavailable(tmp_path) -> None:
     database_path = tmp_path / "ecotherm.sqlite"
     _create_grid_database(database_path)
