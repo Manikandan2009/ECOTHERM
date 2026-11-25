@@ -142,7 +142,7 @@ type DashboardSummary = {
   unavailable_metrics: string[]
 }
 
-const API_BASE = 'http://127.0.0.1:8000'
+const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000'
 
 function formatNumber(value: number | null | undefined, digits = 1) {
   if (value == null || !Number.isFinite(value)) return 'Unavailable'

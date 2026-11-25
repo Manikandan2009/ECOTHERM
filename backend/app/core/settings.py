@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     cache_dir: Path = PROJECT_ROOT / "data" / "cache"
     open_meteo_archive_url: str = "https://archive-api.open-meteo.com/v1/archive"
     open_meteo_timeout_seconds: float = 30.0
+    cors_origins: list[str] = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ]
 
 
 @lru_cache
