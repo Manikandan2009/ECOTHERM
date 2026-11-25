@@ -1,0 +1,17 @@
+
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>ECOTHERM</title>
+    <script>
+      const path = window.location.pathname;
+      const base = '/ECOTHERM/';
+      const route = path.startsWith(base) ? path.slice(base.length) : '';
+      window.location.replace(base + '?redirect=' + encodeURIComponent(route + window.location.search + window.location.hash));
+    </script>
+  </head>
+  <body>
+    Redirecting to ECOTHERM...
+  </body>
+</html>
