@@ -4,14 +4,18 @@ services:
     runtime: python
     rootDir: backend
     plan: free
-    buildCommand: pip install ".[geospatial,ml]"
+    buildCommand: pip install ".[geospatial,ml]" && python -m app.cache_restore
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.8
+      - key: ECOTHERM_CACHE_ARCHIVE_URL
+        value: https://github.com/Manikandan2009/ECOTHERM/releases/download/ecotherm-cache-2026-11-25/ecotherm-cache.tar.gz
+      - key: ECOTHERM_CACHE_SHA256
+        value: 4e8a3a467e98b2075241d16a745c7853406b579da56008c007276e781cb12e99
       - key: ECOTHERM_CORS_ORIGINS
-        value: '["http://localhost:5173","http://127.0.0.1:5173","https://ecotherm-dashboard.onrender.com"]'
+        value: '["http://localhost:5173","http://127.0.0.1:5173","https://ecotherm-dashboard.onrender.com","https://manikandan2009.github.io"]'
   - type: web
     name: ecotherm-dashboard
     runtime: static
@@ -20,7 +24,7 @@ services:
     staticPublishPath: dist
     envVars:
       - key: VITE_API_BASE_URL
-        value: https://ecotherm-api.onrender.com
+        value: https://ecotherm.onrender.com
     routes:
       - type: rewrite
         source: /*
