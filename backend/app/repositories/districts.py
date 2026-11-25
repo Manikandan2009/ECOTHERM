@@ -1,4 +1,5 @@
 import json
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -11,8 +12,18 @@ def load_district_boundaries(cache_dir: Path) -> dict[str, Any]:
     geojson_path = cache_dir / "processed" / "boundaries" / "districts.geojson"
     manifest_path = cache_dir / "processed" / "boundaries" / "districts_manifest.json"
     try:
-        geojson = json.loads(geojson_path.read_text(encoding="utf-8"))
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        geojson_stat = geojson_path.stat()
+        manifest_stat = manifest_path.stat()
+        geojson, manifest = _read_boundary_documents(
+            str(geojson_path.resolve()),
+            geojson_stat.st_mtime_ns,
+            geojson_stat.st_ctime_ns,
+            geojson_stat.st_size,
+            str(manifest_path.resolve()),
+            manifest_stat.st_mtime_ns,
+            manifest_stat.st_ctime_ns,
+            manifest_stat.st_size,
+        )
     except (OSError, json.JSONDecodeError) as exc:
         raise DistrictBoundaryError(
             f"Could not read cached district boundaries: {exc}"
@@ -52,3 +63,28 @@ def load_district_boundaries(cache_dir: Path) -> dict[str, Any]:
         "districts": districts,
         "geojson": geojson,
     }
+
+
+@lru_cache(maxsize=4)
+def _read_boundary_documents(
+    geojson_path: str,
+    geojson_mtime_ns: int,
+    geojson_ctime_ns: int,
+    geojson_size: int,
+    manifest_path: str,
+    manifest_mtime_ns: int,
+    manifest_ctime_ns: int,
+    manifest_size: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    del (
+        geojson_mtime_ns,
+        geojson_ctime_ns,
+        geojson_size,
+        manifest_mtime_ns,
+        manifest_ctime_ns,
+        manifest_size,
+    )
+    return (
+        json.loads(Path(geojson_path).read_text(encoding="utf-8")),
+        json.loads(Path(manifest_path).read_text(encoding="utf-8")),
+    )

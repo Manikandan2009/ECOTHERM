@@ -89,12 +89,14 @@ def _colourize_layer(values: np.ndarray, layer: str) -> np.ndarray:
 def _render_cached_tile(
     raster_path: str,
     modified_ns: int,
+    changed_ns: int,
+    file_size: int,
     layer: str,
     zoom: int,
     x: int,
     y: int,
 ) -> bytes:
-    del modified_ns
+    del modified_ns, changed_ns, file_size
     band = LAYER_BANDS.get(layer)
     if band is None:
         raise MapLayerError(f"Unknown satellite layer: {layer}.")
@@ -153,12 +155,14 @@ def render_satellite_tile(
     if not raster_path.is_file():
         raise MapLayerError("Cached statewide satellite raster is unavailable.")
     try:
-        modified_ns = raster_path.stat().st_mtime_ns
+        stat = raster_path.stat()
     except OSError as exc:
         raise MapLayerError(f"Could not inspect cached satellite raster: {exc}") from exc
     return _render_cached_tile(
         str(raster_path),
-        modified_ns,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+        stat.st_size,
         layer,
         zoom,
         x,

@@ -1,9 +1,9 @@
 import json
-from types import SimpleNamespace
 
 import pytest
 
 from app.repositories import analytics
+from app.schemas.analytics import AnalyticsResponse
 
 
 def _write_region_cache(cache_dir, collection, region_id, manifest, rows) -> None:
@@ -75,12 +75,14 @@ def test_environmental_analytics_uses_cached_metrics_and_keeps_weather_context(
     )
     monkeypatch.setattr(
         analytics,
-        "load_dashboard_summary",
-        lambda *args, **kwargs: SimpleNamespace(
-            weather_mean_air_temperature_c=30.0,
-            weather_model="era5_land",
-            weather_start_date="2026-04-01",
-            weather_end_date="2026-06-30",
+        "load_cached_weather_summary",
+        lambda *args, **kwargs: (
+            30.0,
+            None,
+            "era5_land",
+            "reanalysis_estimate",
+            "2026-04-01",
+            "2026-06-30",
         ),
     )
 
@@ -118,3 +120,45 @@ def test_environmental_analytics_keeps_missing_cache_values_unavailable(tmp_path
     assert "No cached 2026 district data" in result.lst_reason
     assert result.resolution_m is None
     assert result.composite_start is None
+
+
+def test_environmental_analytics_cache_reuses_results_and_invalidates_on_file_change(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    processed = tmp_path / "processed"
+    processed.mkdir()
+    dataset = processed / "ecotherm.sqlite"
+    dataset.write_bytes(b"v1")
+    calls = []
+
+    def build_result(cache_dir, *, season_year):
+        calls.append((cache_dir, season_year))
+        return AnalyticsResponse(
+            season_year=season_year,
+            data_status="unavailable",
+            lst_source="test",
+            population_source="test",
+            ndvi_source="test",
+            air_temperature_source="test",
+            regions=[],
+        )
+
+    analytics.clear_environmental_analytics_cache()
+    monkeypatch.setattr(
+        analytics,
+        "_load_environmental_analytics_uncached",
+        build_result,
+    )
+
+    first = analytics.load_environmental_analytics(tmp_path, season_year=2026)
+    first.lst_source = "caller mutation"
+    second = analytics.load_environmental_analytics(tmp_path, season_year=2026)
+    assert first is not second
+    assert second.lst_source == "test"
+    assert len(calls) == 1
+
+    dataset.write_bytes(b"v2 with a changed size")
+    analytics.load_environmental_analytics(tmp_path, season_year=2026)
+    assert len(calls) == 2
+    analytics.clear_environmental_analytics_cache()

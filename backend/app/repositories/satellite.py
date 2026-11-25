@@ -4,10 +4,8 @@ import math
 import sqlite3
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
-
-from app.repositories.grid_exports import GridExportError, read_grid_export
+from app.repositories.grid_exports import GridExportError
+from app.repositories.grid_metrics import GridExportMetrics, read_grid_export_metrics
 from app.schemas.satellite import (
     SatelliteAnalysisSummary,
     SatelliteMetric,
@@ -176,18 +174,19 @@ def load_satellite_summary(
     }:
         resolution_m = 1000 if region_id == "tamil_nadu" else 100
         try:
-            grid_export = read_grid_export(
+            grid_export_metrics = read_grid_export_metrics(
                 cache_dir,
                 region_id=region_id,
                 season_year=season_year,
                 resolution_m=resolution_m,
                 columns=METRICS,
+                required_columns=METRICS,
             )
         except GridExportError as exc:
             raise SatelliteRepositoryError(str(exc)) from exc
-        if grid_export is not None:
-            return _summary_from_grid_export(
-                grid_export,
+        if grid_export_metrics is not None:
+            return _summary_from_grid_metrics(
+                grid_export_metrics,
                 region_id=region_id,
                 season_year=season_year,
                 resolution_m=resolution_m,
@@ -252,26 +251,25 @@ def load_satellite_summary(
     )
 
 
-def _summary_from_grid_export(
-    grid_export: pd.DataFrame,
+def _summary_from_grid_metrics(
+    grid_metrics: GridExportMetrics,
     *,
     region_id: str,
     season_year: int,
     resolution_m: int,
 ) -> SatelliteAnalysisSummary:
-    cell_count = len(grid_export)
+    cell_count = grid_metrics.grid_cell_count
+    metric_values = (
+        grid_metrics.lst,
+        grid_metrics.ndvi,
+        grid_metrics.ndbi,
+        grid_metrics.ndwi,
+    )
     metrics: list[SatelliteMetric] = []
-    for metric in METRICS:
-        values = pd.to_numeric(grid_export[metric], errors="coerce")
-        lower, upper = (0, 80) if metric == "lst_c" else (-1, 1)
-        valid = values[np.isfinite(values) & values.between(lower, upper)]
-        metrics.append(
-            _metric(
-                cell_count,
-                len(valid),
-                float(valid.mean()) if not valid.empty else None,
-            )
-        )
+    for values in metric_values:
+        if values is None:
+            raise SatelliteRepositoryError("Cached satellite grid metrics are incomplete.")
+        metrics.append(_metric(cell_count, values.valid_cell_count, values.mean))
     valid_metrics = sum(metric.valid_cell_count not in (None, 0) for metric in metrics)
     return SatelliteAnalysisSummary(
         region_id=region_id,

@@ -5,6 +5,7 @@ import csv
 import pandas as pd
 import pytest
 
+from app.repositories import dashboard
 from app.repositories.dashboard import load_dashboard_summary
 
 
@@ -393,6 +394,33 @@ def test_constituency_summary_derives_heat_island_intensity_from_cached_grid(
 
     assert summary.urban_heat_island_intensity_c == pytest.approx(-0.5)
     assert "urban_heat_island_intensity" not in summary.unavailable_metrics
+
+
+def test_statewide_lst_mean_reuses_grid_metrics_without_changing_validity_rules(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    grid_dir = tmp_path / "processed" / "grids"
+    grid_dir.mkdir(parents=True)
+    pd.DataFrame(
+        {"lst_c": [40.0, 42.0, 100.0, None, float("inf")]}
+    ).to_csv(grid_dir / "tamil_nadu_1000m_2026.csv", index=False)
+    read_count = 0
+    original_read_csv = pd.read_csv
+
+    def counting_read_csv(*args, **kwargs):
+        nonlocal read_count
+        read_count += 1
+        return original_read_csv(*args, **kwargs)
+
+    monkeypatch.setattr(dashboard.pd, "read_csv", counting_read_csv)
+
+    first = dashboard._read_statewide_mean_lst(tmp_path, 2026)
+    second = dashboard._read_statewide_mean_lst(tmp_path, 2026)
+
+    assert first == pytest.approx((40.0 + 42.0 + 100.0) / 3)
+    assert second == first
+    assert read_count == 1
 
 
 def test_district_risk_counts_require_complete_risk_inputs(tmp_path) -> None:

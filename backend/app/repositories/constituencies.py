@@ -1,4 +1,5 @@
 import json
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -13,14 +14,20 @@ def load_constituencies(
     district_id: str | None = None,
 ) -> dict[str, Any]:
     boundary_dir = cache_dir / "processed" / "boundaries"
+    geojson_path = boundary_dir / "constituencies.geojson"
+    manifest_path = boundary_dir / "constituencies_manifest.json"
     try:
-        geojson = json.loads(
-            (boundary_dir / "constituencies.geojson").read_text(encoding="utf-8")
-        )
-        manifest = json.loads(
-            (boundary_dir / "constituencies_manifest.json").read_text(
-                encoding="utf-8"
-            )
+        geojson_stat = geojson_path.stat()
+        manifest_stat = manifest_path.stat()
+        geojson, manifest = _read_constituency_documents(
+            str(geojson_path.resolve()),
+            geojson_stat.st_mtime_ns,
+            geojson_stat.st_ctime_ns,
+            geojson_stat.st_size,
+            str(manifest_path.resolve()),
+            manifest_stat.st_mtime_ns,
+            manifest_stat.st_ctime_ns,
+            manifest_stat.st_size,
         )
     except (OSError, json.JSONDecodeError) as exc:
         raise ConstituencyBoundaryError(
@@ -144,3 +151,28 @@ def load_constituencies(
             "features": selected_features,
         },
     }
+
+
+@lru_cache(maxsize=4)
+def _read_constituency_documents(
+    geojson_path: str,
+    geojson_mtime_ns: int,
+    geojson_ctime_ns: int,
+    geojson_size: int,
+    manifest_path: str,
+    manifest_mtime_ns: int,
+    manifest_ctime_ns: int,
+    manifest_size: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    del (
+        geojson_mtime_ns,
+        geojson_ctime_ns,
+        geojson_size,
+        manifest_mtime_ns,
+        manifest_ctime_ns,
+        manifest_size,
+    )
+    return (
+        json.loads(Path(geojson_path).read_text(encoding="utf-8")),
+        json.loads(Path(manifest_path).read_text(encoding="utf-8")),
+    )

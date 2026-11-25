@@ -1,5 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from starlette.types import Receive, Scope, Send
 
 from app.api.v1.weather import router as weather_router
 from app.api.v1.dashboard import router as dashboard_router
@@ -13,6 +15,20 @@ from app.api.v1.analytics import router as analytics_router
 from app.api.v1.priorities import router as priorities_router
 from app.core.settings import get_settings
 
+
+class JsonGZipMiddleware(GZipMiddleware):
+    async def __call__(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        if scope["type"] == "http" and scope.get("path", "").startswith("/api/v1/map/"):
+            await self.app(scope, receive, send)
+            return
+        await super().__call__(scope, receive, send)
+
+
 app = FastAPI(
     title="ECOTHERM API",
     description="File-backed urban heat data services for Tamil Nadu.",
@@ -24,6 +40,7 @@ app.add_middleware(
     allow_methods=["GET"],
     allow_headers=["*"],
 )
+app.add_middleware(JsonGZipMiddleware, minimum_size=1024, compresslevel=5)
 app.include_router(weather_router)
 app.include_router(dashboard_router)
 app.include_router(districts_router)

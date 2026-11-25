@@ -1,7 +1,6 @@
 import sqlite3
 from datetime import date
 from pathlib import Path
-import csv
 import json
 import math
 from typing import Any
@@ -9,7 +8,13 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from app.repositories.grid_exports import GridExportError, read_grid_export
+from app.repositories.grid_exports import GridExportError
+from app.repositories.grid_metrics import (
+    GridExportMetrics,
+    read_grid_export_metrics,
+    read_region_csv_metrics,
+)
+from app.repositories.weather_cache import load_cached_weather_summary
 from app.schemas.dashboard import DashboardSummary
 
 
@@ -39,24 +44,33 @@ def load_dashboard_summary(
         if region_id == "tamil_nadu"
         else {}
     )
-    grid_export = None
+    grid_export_metrics: GridExportMetrics | None = None
     if region_id in {"tamil_nadu", "chennai", "coimbatore", "madurai"}:
+        grid_columns = ("lst_c", "population_estimated_2025")
+        if region_id == "tamil_nadu":
+            grid_columns += ("ndvi", "ndbi", "ndwi")
+        required_columns = ("lst_c", "population_estimated_2025")
+        if region_id == "tamil_nadu" and database_path.is_file():
+            required_columns += ("ndvi", "ndbi")
         try:
-            grid_export = read_grid_export(
+            grid_export_metrics = read_grid_export_metrics(
                 database_path.parent.parent,
                 region_id=region_id,
                 season_year=season_year,
                 resolution_m=grid_resolution_m or 1000,
-                columns=("lst_c", "population_estimated_2025"),
+                columns=grid_columns,
+                required_columns=required_columns,
             )
         except GridExportError as exc:
             raise DashboardRepositoryError(str(exc)) from exc
     export_summary = (
-        _grid_export_summary(grid_export) if grid_export is not None else None
+        _grid_export_summary(grid_export_metrics)
+        if grid_export_metrics is not None
+        else None
     )
     if not database_path.is_file():
-        mean, maximum, model, status, start_date, end_date = _read_cached_weather(
-            database_path,
+        mean, maximum, model, status, start_date, end_date = load_cached_weather_summary(
+            database_path.parent.parent,
             location_id=f"{region_id}_reference",
             season_year=season_year,
         )
@@ -141,10 +155,13 @@ def load_dashboard_summary(
     try:
         database_uri = f"{database_path.resolve().as_uri()}?mode=ro"
         with sqlite3.connect(database_uri, uri=True) as connection:
-            grid_table = connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='grid_observations'"
-            ).fetchone()
-            if grid_table:
+            if export_summary is None or grid_resolution_m is None:
+                grid_table = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='grid_observations'"
+                ).fetchone()
+            else:
+                grid_table = None
+            if grid_table and export_summary is None:
                 row = connection.execute(
                     """
                     SELECT
@@ -171,6 +188,17 @@ def load_dashboard_summary(
                         stored_resolution,
                     ) = row
                     grid_resolution_m = grid_resolution_m or stored_resolution
+            elif grid_table and grid_resolution_m is None:
+                resolution = connection.execute(
+                    """
+                    SELECT MIN(resolution_m)
+                    FROM grid_observations
+                    WHERE region_id = ? AND season_year = ?
+                    """,
+                    (region_id, season_year),
+                ).fetchone()
+                if resolution:
+                    grid_resolution_m = resolution[0]
 
             weather_table = connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='weather_daily'"
@@ -231,8 +259,8 @@ def load_dashboard_summary(
             weather_status,
             weather_start,
             weather_end,
-        ) = _read_cached_weather(
-            database_path,
+        ) = load_cached_weather_summary(
+            database_path.parent.parent,
             location_id=f"{region_id}_reference",
             season_year=season_year,
         )
@@ -240,10 +268,9 @@ def load_dashboard_summary(
     high_risk_cells = None
     uhi_intensity = None
     if region_id == "tamil_nadu":
-        people_exposed, high_risk_cells = _read_cached_risk_summary(
-            database_path.parent.parent,
-            season_year,
-        )
+        if grid_export_metrics is not None:
+            people_exposed = grid_export_metrics.people_exposed_high_heat
+            high_risk_cells = grid_export_metrics.high_risk_cell_count
         if lst_mean is not None:
             uhi_intensity = 0.0
         if people_exposed is not None:
@@ -299,25 +326,17 @@ class DashboardRepositoryError(RuntimeError):
     """Raised when persisted dashboard summaries cannot be read."""
 
 
-def _grid_export_summary(frame: pd.DataFrame) -> dict[str, float | int | None]:
-    lst_values = pd.to_numeric(frame["lst_c"], errors="coerce")
-    valid_lst = lst_values[np.isfinite(lst_values) & lst_values.between(0, 80)]
-    population_values = pd.to_numeric(
-        frame["population_estimated_2025"],
-        errors="coerce",
-    )
-    valid_population = population_values[
-        np.isfinite(population_values) & (population_values >= 0)
-    ]
+def _grid_export_summary(
+    metrics: GridExportMetrics,
+) -> dict[str, float | int | None]:
+    lst = metrics.lst
     return {
-        "grid_cell_count": len(frame),
-        "lst_valid_cell_count": len(valid_lst),
-        "lst_mean_c": float(valid_lst.mean()) if not valid_lst.empty else None,
-        "lst_max_c": float(valid_lst.max()) if not valid_lst.empty else None,
-        "population_valid_cell_count": len(valid_population),
-        "estimated_population_2025": (
-            float(valid_population.sum()) if not valid_population.empty else None
-        ),
+        "grid_cell_count": metrics.grid_cell_count,
+        "lst_valid_cell_count": lst.valid_cell_count if lst else 0,
+        "lst_mean_c": lst.mean if lst else None,
+        "lst_max_c": lst.maximum if lst else None,
+        "population_valid_cell_count": metrics.population_valid_cell_count or 0,
+        "estimated_population_2025": metrics.estimated_population_2025,
     }
 
 
@@ -345,102 +364,19 @@ def _read_cached_osm_summary(cache_dir: Path) -> dict[str, Any]:
     return summary
 
 
-def _read_cached_risk_summary(
-    cache_dir: Path,
-    season_year: int,
-) -> tuple[float | None, int | None]:
-    path = (
-        cache_dir
-        / "processed"
-        / "grids"
-        / f"tamil_nadu_1000m_{season_year}.csv"
-    )
-    if not path.is_file():
-        return None, None
-    try:
-        cells = pd.read_csv(
-            path,
-            usecols=(
-                "lst_c",
-                "ndvi",
-                "ndbi",
-                "population_estimated_2025",
-            ),
-        )
-    except (
-        OSError,
-        pd.errors.EmptyDataError,
-        pd.errors.ParserError,
-        ValueError,
-    ) as exc:
-        raise DashboardRepositoryError(
-            f"Could not read the cached statewide risk inputs: {exc}"
-        ) from exc
-    return _calculate_heat_risk(cells)
-
-
-def _calculate_heat_risk(
-    cells: pd.DataFrame,
-) -> tuple[float | None, int | None]:
-    required = (
-        "lst_c",
-        "ndvi",
-        "ndbi",
-        "population_estimated_2025",
-    )
-    valid = cells.loc[:, required].replace([np.inf, -np.inf], np.nan).dropna()
-    if valid.empty:
-        return None, None
-    exposure = valid["lst_c"].rank(pct=True).mul(100).clip(0, 100)
-    low_vegetation = (
-        ((0.4 - valid["ndvi"]).clip(-0.6, 0.6) + 0.6)
-        .div(1.2)
-        .mul(100)
-        .clip(0, 100)
-    )
-    built_up = valid["ndbi"].clip(-1, 1).add(1).div(2).mul(100)
-    population = valid["population_estimated_2025"]
-    density_cap = population.quantile(0.95)
-    density_score = (
-        population.div(density_cap).mul(100).clip(0, 100)
-        if pd.notna(density_cap) and density_cap > 0
-        else pd.Series(0, index=valid.index)
-    )
-    vulnerability = (
-        low_vegetation.mul(0.4)
-        + built_up.mul(0.35)
-        + density_score.mul(0.25)
-    ).clip(0, 100)
-    risk = exposure.mul(vulnerability).div(100).clip(0, 100)
-    high_risk = risk >= 75
-    people_exposed = float(population.loc[high_risk].sum())
-    return people_exposed, int(high_risk.sum())
-
-
 def _read_statewide_mean_lst(cache_dir: Path, season_year: int) -> float | None:
-    state_csv = (
-        cache_dir
-        / "processed"
-        / "grids"
-        / f"tamil_nadu_1000m_{season_year}.csv"
-    )
-    if not state_csv.is_file():
-        return None
     try:
-        values = pd.read_csv(state_csv, usecols=["lst_c"])["lst_c"]
-    except (
-        OSError,
-        pd.errors.EmptyDataError,
-        pd.errors.ParserError,
-        KeyError,
-        ValueError,
-    ):
+        metrics = read_grid_export_metrics(
+            cache_dir,
+            region_id="tamil_nadu",
+            season_year=season_year,
+            resolution_m=1000,
+            columns=("lst_c",),
+            required_columns=("lst_c",),
+        )
+    except GridExportError:
         return None
-    valid_values = values.replace([np.inf, -np.inf], np.nan).dropna()
-    if valid_values.empty:
-        return None
-    mean = float(valid_values.mean())
-    return mean if math.isfinite(mean) else None
+    return metrics.lst_finite_mean if metrics is not None else None
 
 
 def _coverage_percent(valid_cells: int | None, total_cells: int | None) -> float | None:
@@ -619,9 +555,14 @@ def _load_district_summary(
     )
     if csv_path.is_file():
         try:
-            district_cells = pd.read_csv(csv_path)
-            people_exposed, high_risk_cells = _calculate_heat_risk(district_cells)
-        except (OSError, pd.errors.EmptyDataError, KeyError, ValueError):
+            district_metrics = read_region_csv_metrics(
+                csv_path,
+                include_heat_risk=True,
+            )
+            if district_metrics is not None:
+                people_exposed = district_metrics.people_exposed_high_heat
+                high_risk_cells = district_metrics.high_risk_cell_count
+        except GridExportError:
             people_exposed = None
             high_risk_cells = None
     state_mean = _read_statewide_mean_lst(cache_dir, season_year)
@@ -629,8 +570,8 @@ def _load_district_summary(
         uhi_intensity = float(lst_mean) - state_mean
 
     weather_location = f"{district_id}_reference"
-    weather = _read_cached_weather(
-        database_path,
+    weather = load_cached_weather_summary(
+        cache_dir,
         location_id=weather_location,
         season_year=season_year,
     )
@@ -675,62 +616,6 @@ def _load_district_summary(
         people_exposed_high_heat=people_exposed,
         high_risk_cell_count=high_risk_cells,
         unavailable_metrics=unavailable,
-    )
-
-
-def _read_cached_weather(
-    database_path: Path,
-    *,
-    location_id: str,
-    season_year: int,
-) -> tuple[float | None, float | None, str | None, str | None,
-           str | None, str | None]:
-    cache_dir = database_path.parent.parent
-    daily_directory = cache_dir / "processed" / "open_meteo"
-    if not daily_directory.is_dir():
-        return None, None, None, None, None, None
-
-    start_date = f"{season_year}-04-01"
-    end_date = f"{season_year}-06-30"
-    mean_values: list[float] = []
-    max_values: list[float] = []
-    models: set[str] = set()
-    statuses: set[str] = set()
-    dates: list[str] = []
-
-    for csv_path in sorted(daily_directory.glob("*_daily.csv")):
-        try:
-            with csv_path.open("r", encoding="utf-8", newline="") as handle:
-                for row in csv.DictReader(handle):
-                    if row.get("location_id") != location_id:
-                        continue
-                    row_date = row.get("date_local")
-                    if not row_date or row_date < start_date or row_date > end_date:
-                        continue
-                    dates.append(row_date)
-                    if row.get("model"):
-                        models.add(row["model"])
-                    if row.get("data_status"):
-                        statuses.add(row["data_status"])
-                    try:
-                        if row.get("temperature_2m_mean_c"):
-                            mean_values.append(float(row["temperature_2m_mean_c"]))
-                        if row.get("temperature_2m_max_c"):
-                            max_values.append(float(row["temperature_2m_max_c"]))
-                    except ValueError:
-                        continue
-        except (OSError, csv.Error):
-            continue
-
-    if not mean_values and not max_values:
-        return None, None, None, None, None, None
-    return (
-        sum(mean_values) / len(mean_values) if mean_values else None,
-        max(max_values) if max_values else None,
-        sorted(models)[0] if models else None,
-        sorted(statuses)[0] if statuses else None,
-        min(dates) if dates else None,
-        max(dates) if dates else None,
     )
 
 

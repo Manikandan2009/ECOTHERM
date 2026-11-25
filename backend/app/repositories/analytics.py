@@ -1,15 +1,17 @@
-import csv
 import json
 import math
+import threading
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from app.repositories.dashboard import DashboardRepositoryError, load_dashboard_summary
-from app.repositories.districts import DistrictBoundaryError, load_district_boundaries
 from app.repositories.constituencies import (
     ConstituencyBoundaryError,
     load_constituencies,
 )
+from app.repositories.districts import DistrictBoundaryError, load_district_boundaries
+from app.repositories.grid_metrics import GridExportError, read_region_csv_metrics
+from app.repositories.weather_cache import load_cached_weather_summary
 from app.schemas.analytics import AnalyticsRegion, AnalyticsResponse
 
 LST_SOURCE = "Landsat 8/9 Collection 2 Level 2 L2SP ST_B10"
@@ -19,6 +21,7 @@ AIR_TEMPERATURE_SOURCE = (
     "Open-Meteo ERA5-Land daily reanalysis estimate; "
     "0.1° (~11 km) model grid; regional context only"
 )
+_ANALYTICS_CACHE_LOCK = threading.RLock()
 
 
 class AnalyticsRepositoryError(RuntimeError):
@@ -30,13 +33,80 @@ def load_environmental_analytics(
     *,
     season_year: int,
 ) -> AnalyticsResponse:
+    dataset_version = _analytics_dataset_version(cache_dir, season_year)
+    with _ANALYTICS_CACHE_LOCK:
+        result = _load_environmental_analytics_cached(
+            str(cache_dir.resolve()),
+            season_year,
+            dataset_version,
+        )
+        return result.model_copy(deep=True)
+
+
+@lru_cache(maxsize=4)
+def _load_environmental_analytics_cached(
+    cache_dir_string: str,
+    season_year: int,
+    dataset_version: tuple[tuple[str, int, int, int], ...],
+) -> AnalyticsResponse:
+    del dataset_version
+    return _load_environmental_analytics_uncached(
+        Path(cache_dir_string),
+        season_year=season_year,
+    )
+
+
+def clear_environmental_analytics_cache() -> None:
+    with _ANALYTICS_CACHE_LOCK:
+        _load_environmental_analytics_cached.cache_clear()
+
+
+def _analytics_dataset_version(
+    cache_dir: Path,
+    season_year: int,
+) -> tuple[tuple[str, int, int, int], ...]:
+    processed = cache_dir / "processed"
+    files = [
+        processed / "ecotherm.sqlite",
+        processed / "boundaries" / "districts.geojson",
+        processed / "boundaries" / "districts_manifest.json",
+        processed / "boundaries" / "constituencies.geojson",
+        processed / "boundaries" / "constituencies_manifest.json",
+    ]
+    files.extend((processed / "open_meteo").glob("*_daily.csv"))
+    for collection in ("districts", "constituencies"):
+        batch_root = processed / collection / "static_batches"
+        files.extend(batch_root.glob("*/manifest.json"))
+        files.extend(batch_root.glob(f"*/*_{season_year}.csv"))
+
+    version: list[tuple[str, int, int, int]] = []
+    for path in sorted(set(files)):
+        try:
+            stat = path.stat()
+            version.append(
+                (
+                    str(path.relative_to(cache_dir)),
+                    stat.st_mtime_ns,
+                    stat.st_ctime_ns,
+                    stat.st_size,
+                )
+            )
+        except OSError:
+            version.append((str(path.relative_to(cache_dir)), -1, -1, -1))
+    return tuple(version)
+
+
+def _load_environmental_analytics_uncached(
+    cache_dir: Path,
+    *,
+    season_year: int,
+) -> AnalyticsResponse:
     try:
         districts = load_district_boundaries(cache_dir)["districts"]
         constituencies = load_constituencies(cache_dir)["constituencies"]
     except (DistrictBoundaryError, ConstituencyBoundaryError) as exc:
         raise AnalyticsRepositoryError(str(exc)) from exc
 
-    database_path = cache_dir / "processed" / "ecotherm.sqlite"
     regions: list[AnalyticsRegion] = []
     district_weather: dict[
         str, tuple[float | None, str | None, str | None, str | None]
@@ -52,31 +122,25 @@ def load_environmental_analytics(
             district_name=district["district_name"],
             region_type="district",
         )
-        try:
-            summary = load_dashboard_summary(
-                database_path,
-                region_id=f"district_{district_id}",
-                season_year=season_year,
-                grid_resolution_m=1000,
-            )
-        except DashboardRepositoryError as exc:
-            raise AnalyticsRepositoryError(
-                f"Could not read air-temperature context for {district['district_name']}: {exc}"
-            ) from exc
-        region.air_temperature_mean_c = summary.weather_mean_air_temperature_c
-        region.air_temperature_model = summary.weather_model
-        region.air_temperature_start_date = summary.weather_start_date
-        region.air_temperature_end_date = summary.weather_end_date
+        weather = load_cached_weather_summary(
+            cache_dir,
+            location_id=f"{district_id}_reference",
+            season_year=season_year,
+        )
+        region.air_temperature_mean_c = weather[0]
+        region.air_temperature_model = weather[2]
+        region.air_temperature_start_date = weather[4]
+        region.air_temperature_end_date = weather[5]
         region.air_temperature_reason = (
             None
-            if summary.weather_mean_air_temperature_c is not None
+            if weather[0] is not None
             else "No cached district-reference air-temperature series is available."
         )
         district_weather[district_id] = (
-            summary.weather_mean_air_temperature_c,
-            summary.weather_model,
-            summary.weather_start_date,
-            summary.weather_end_date,
+            weather[0],
+            weather[2],
+            weather[4],
+            weather[5],
         )
         regions.append(region)
 
@@ -166,7 +230,11 @@ def _load_region(
         if region_type == "district"
         else "population_estimated_2025",
     )
-    ndvi_mean = _mean_ndvi(csv_path, region_name)
+    ndvi_mean = _mean_ndvi(
+        csv_path,
+        region_name,
+        include_heat_risk=region_type == "district",
+    )
     lst_coverage = (
         lst_valid_count / cell_count * 100
         if lst_valid_count is not None and cell_count and cell_count > 0
@@ -241,31 +309,30 @@ def _load_region(
     )
 
 
-def _mean_ndvi(csv_path: Path, region_name: str) -> float | None:
+def _mean_ndvi(
+    csv_path: Path,
+    region_name: str,
+    *,
+    include_heat_risk: bool = False,
+) -> float | None:
     if not csv_path.is_file():
         return None
-    values: list[float] = []
     try:
-        with csv_path.open("r", encoding="utf-8", newline="") as source:
-            reader = csv.DictReader(source)
-            if not reader.fieldnames or "ndvi" not in reader.fieldnames:
-                raise AnalyticsRepositoryError(
-                    f"Cached grid CSV for {region_name} is missing the NDVI column."
-                )
-            for row in reader:
-                if row.get("ndvi_valid", "").casefold() == "false":
-                    continue
-                try:
-                    value = float(row["ndvi"])
-                except (TypeError, ValueError):
-                    continue
-                if math.isfinite(value) and -1 <= value <= 1:
-                    values.append(value)
-    except (OSError, csv.Error) as exc:
+        metrics = read_region_csv_metrics(
+            csv_path,
+            include_heat_risk=include_heat_risk,
+        )
+    except GridExportError as exc:
         raise AnalyticsRepositoryError(
             f"Could not read cached NDVI cells for {region_name}: {exc}"
         ) from exc
-    return sum(values) / len(values) if values else None
+    if metrics is None:
+        return None
+    if "ndvi" not in metrics.columns:
+        raise AnalyticsRepositoryError(
+            f"Cached grid CSV for {region_name} is missing the NDVI column."
+        )
+    return metrics.ndvi_mean
 
 
 def _number(manifest: dict[str, Any] | None, key: str) -> float | None:

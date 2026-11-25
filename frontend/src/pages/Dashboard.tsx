@@ -5,6 +5,7 @@ import { CartesianGrid, Line, LineChart, ResponsiveContainer, Scatter, ScatterCh
 import { GeoJSON, MapContainer, Pane, TileLayer, useMap, useMapEvents } from 'react-leaflet'
 import type { FeatureCollection, Geometry, Position } from 'geojson'
 import Brand from '../components/Brand'
+import { requestJson } from '../lib/apiCache'
 
 const sections = [
   { id: 'overview', label: 'Overview', icon: 'grid' },
@@ -143,6 +144,17 @@ type DashboardSummary = {
 }
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'https://ecotherm.onrender.com'
+const API_CACHE_TTL = {
+  boundary: 5 * 60 * 1000,
+  summary: 60 * 1000,
+  analysis: 5 * 60 * 1000,
+}
+const INSPECTION_CELL_STYLE = {
+  color: '#f5cb70',
+  weight: 2,
+  fillColor: '#f5cb70',
+  fillOpacity: 0.1,
+}
 
 function formatNumber(value: number | null | undefined, digits = 1) {
   if (value == null || !Number.isFinite(value)) return 'Unavailable'
@@ -887,10 +899,15 @@ export default function Dashboard() {
 
   useEffect(() => {
     const controller = new AbortController()
-    fetch(`${API_BASE}/api/v1/districts`, { signal: controller.signal })
-      .then(async (response) => {
-        if (!response.ok) throw new Error(`District boundary request failed (${response.status})`)
-        return (await response.json()) as DistrictCollection
+    requestJson<DistrictCollection>(`${API_BASE}/api/v1/districts`, {
+      signal: controller.signal,
+      ttlMs: API_CACHE_TTL.boundary,
+    })
+      .then((result) => {
+        if (!result.ok) {
+          throw new Error(`District boundary request failed (${result.status}): ${result.detail}`)
+        }
+        return result.data
       })
       .then((data) => setDistrictCollection(data))
       .catch((error: unknown) => {
@@ -926,13 +943,18 @@ export default function Dashboard() {
     const controller = new AbortController()
     setConstituencyCollection(null)
     setConstituencyError(null)
-    fetch(
+    requestJson<ConstituencyCollection>(
       `${API_BASE}/api/v1/constituencies?district_id=${encodeURIComponent(districtId)}`,
-      { signal: controller.signal },
+      {
+        signal: controller.signal,
+        ttlMs: API_CACHE_TTL.boundary,
+      },
     )
-      .then(async (response) => {
-        if (!response.ok) throw new Error(`Constituency boundary request failed (${response.status})`)
-        return (await response.json()) as ConstituencyCollection
+      .then((result) => {
+        if (!result.ok) {
+          throw new Error(`Constituency boundary request failed (${result.status}): ${result.detail}`)
+        }
+        return result.data
       })
       .then((data) => setConstituencyCollection(data))
       .catch((error: unknown) => {
@@ -957,9 +979,12 @@ export default function Dashboard() {
         const query = constituencyId
           ? `constituency_id=${encodeURIComponent(constituencyId)}`
           : `district_id=${encodeURIComponent(districtId ?? '')}`
-        const response = await fetch(
+        const response = await requestJson<LiveWeather>(
           `${API_BASE}/api/v1/weather/live?${query}`,
-          { signal: controller.signal },
+          {
+            signal: controller.signal,
+            ttlMs: 0,
+          },
         )
         if (disposed) return
         if (!response.ok) {
@@ -972,12 +997,12 @@ export default function Dashboard() {
             wind_speed_10m_kmh: null,
             status: 'unavailable',
             updated_at_utc: null,
-            error,
+            error: `${error} ${response.detail}`,
           })
-          setWeatherRefreshStatus(error)
+          setWeatherRefreshStatus(`${error} ${response.detail}`)
           return
         }
-        const data = await response.json() as LiveWeather
+        const data = response.data
         if (disposed) return
         setLiveWeather(data)
         const updated = formatUpdatedTime(data.updated_at_utc)
@@ -1093,28 +1118,77 @@ export default function Dashboard() {
   const reportWeather = reportAnalyticsRegion?.air_temperature_mean_c
     ?? summary?.weather_mean_air_temperature_c
     ?? null
-  const reportFeatures = constituencyId
-    ? (constituencyCollection?.geojson.features ?? []).filter(
+  const reportFeatures = useMemo(() => {
+    if (constituencyId) {
+      return (constituencyCollection?.geojson.features ?? []).filter(
         (feature) => feature.properties?.constituency_id === constituencyId,
       )
-    : reportDistrictId
-      ? (districtCollection?.geojson.features ?? []).filter(
-          (feature) => feature.properties?.district_id === reportDistrictId,
-        )
-      : districtCollection?.geojson.features ?? []
+    }
+    if (reportDistrictId) {
+      return (districtCollection?.geojson.features ?? []).filter(
+        (feature) => feature.properties?.district_id === reportDistrictId,
+      )
+    }
+    return districtCollection?.geojson.features ?? []
+  }, [constituencyCollection, constituencyId, districtCollection, reportDistrictId])
+  const districtStyle = useCallback(
+    (feature: FeatureCollection['features'][number] | undefined) => {
+      const selectedId = region.startsWith('district_') ? region.slice(9) : null
+      const isSelected = feature?.properties?.district_id === selectedId
+      const isDimmed = selectedId !== null && !isSelected
+      return {
+        color: baseLayer === 'satellite'
+          ? isSelected ? '#a8fff0' : '#d8fff1'
+          : isSelected ? '#b7efc7' : '#83d3a0',
+        weight: isSelected ? (baseLayer === 'satellite' ? 3.5 : 3) : (baseLayer === 'satellite' ? 1.6 : 1),
+        fillColor: baseLayer === 'satellite'
+          ? isSelected ? '#00c6a7' : '#22a6a1'
+          : isSelected ? '#83d3a0' : '#2f7553',
+        fillOpacity: isDimmed
+          ? baseLayer === 'satellite' ? 0.025 : 0.06
+          : isSelected ? baseLayer === 'satellite' ? 0.17 : 0.42
+          : baseLayer === 'satellite' ? 0.055 : 0.16,
+      }
+    },
+    [baseLayer, region],
+  )
+  const constituencyStyle = useCallback(
+    (feature: FeatureCollection['features'][number] | undefined) => {
+      const id = feature?.properties?.constituency_id
+      const selected = id === constituencyId
+      const dimmed = constituencyId !== null && !selected
+      return {
+        color: baseLayer === 'satellite'
+          ? selected ? '#ffe27a' : '#d2fff0'
+          : selected ? '#f5cb70' : '#a9e3bb',
+        weight: selected ? (baseLayer === 'satellite' ? 3.5 : 3) : (baseLayer === 'satellite' ? 1.6 : 1),
+        fillColor: baseLayer === 'satellite'
+          ? selected ? '#f1bb3f' : '#55bca0'
+          : selected ? '#f5cb70' : '#55a879',
+        fillOpacity: dimmed
+          ? baseLayer === 'satellite' ? 0.035 : 0.08
+          : selected ? baseLayer === 'satellite' ? 0.2 : 0.58
+          : baseLayer === 'satellite' ? 0.07 : 0.26,
+      }
+    },
+    [baseLayer, constituencyId],
+  )
   const mapRasterVisible = active === 'satellite'
     ? satelliteOverlayVisible && !satelliteSwipeEnabled
     : lstOverlayVisible
-  const inspectionCellGeojson: FeatureCollection | null = inspection?.cell_outline
-    ? {
-        type: 'FeatureCollection',
-        features: [{
-          type: 'Feature',
-          properties: {},
-          geometry: inspection.cell_outline,
-        }],
-      }
-    : null
+  const inspectionCellGeojson = useMemo<FeatureCollection | null>(
+    () => inspection?.cell_outline
+      ? {
+          type: 'FeatureCollection',
+          features: [{
+            type: 'Feature',
+            properties: {},
+            geometry: inspection.cell_outline,
+          }],
+        }
+      : null,
+    [inspection?.cell_outline],
+  )
   const handleMapInspect = useCallback(async (latitude: number, longitude: number) => {
     const requestId = ++inspectionRequestId.current
     const point = { latitude, longitude }
@@ -1123,14 +1197,14 @@ export default function Dashboard() {
     setInspectionError(null)
     setInspectionLoading(true)
     try {
-      const response = await fetch(
+      const response = await requestJson<MapInspection>(
         `${API_BASE}/api/inspect?lat=${encodeURIComponent(latitude)}&lon=${encodeURIComponent(longitude)}`,
+        { ttlMs: 0 },
       )
       if (!response.ok) {
-        const detail = await response.text()
-        throw new Error(`Map inspection failed (${response.status}): ${detail}`)
+        throw new Error(`Map inspection failed (${response.status}): ${response.detail}`)
       }
-      const data = await response.json() as MapInspection
+      const data = response.data
       if (requestId !== inspectionRequestId.current) return
       setInspection(data)
       setRegion(data.district_id ? `district_${data.district_id}` : 'tamil_nadu')
@@ -1280,16 +1354,18 @@ export default function Dashboard() {
   useEffect(() => {
     const controller = new AbortController()
     setSummaryLoading(true)
-    fetch(
+    requestJson<DashboardSummary>(
       `${API_BASE}/api/v1/summary?region_id=${encodeURIComponent(summaryRegionId)}&season_year=2026`,
-      { signal: controller.signal },
+      {
+        signal: controller.signal,
+        ttlMs: API_CACHE_TTL.summary,
+      },
     )
-      .then(async (response) => {
+      .then((response) => {
         if (!response.ok) {
-          const detail = await response.text()
-          throw new Error(`Dashboard data request failed (${response.status}): ${detail}`)
+          throw new Error(`Dashboard data request failed (${response.status}): ${response.detail}`)
         }
-        return (await response.json()) as DashboardSummary
+        return response.data
       })
       .then((data) => setSummary(data))
       .catch((error: unknown) => {
@@ -1313,16 +1389,18 @@ export default function Dashboard() {
     setScatterSummary(null)
     setScatterLoading(true)
     setScatterError(null)
-    fetch(
+    requestJson<SatelliteScatterSummary>(
       `${API_BASE}/api/v1/satellite/scatter?constituency_id=${encodeURIComponent(constituencyId)}&season_year=2026`,
-      { signal: controller.signal },
+      {
+        signal: controller.signal,
+        ttlMs: API_CACHE_TTL.analysis,
+      },
     )
-      .then(async (response) => {
+      .then((response) => {
         if (!response.ok) {
-          const detail = await response.text()
-          throw new Error(`Satellite cell data request failed (${response.status}): ${detail}`)
+          throw new Error(`Satellite cell data request failed (${response.status}): ${response.detail}`)
         }
-        return (await response.json()) as SatelliteScatterSummary
+        return response.data
       })
       .then((data) => setScatterSummary(data))
       .catch((error: unknown) => {
@@ -1340,15 +1418,18 @@ export default function Dashboard() {
     const controller = new AbortController()
     setAnalyticsLoading(true)
     setAnalyticsError(null)
-    fetch(`${API_BASE}/api/v1/analytics/regions?season_year=2026`, {
-      signal: controller.signal,
-    })
-      .then(async (response) => {
+    requestJson<AnalyticsResponse>(
+      `${API_BASE}/api/v1/analytics/regions?season_year=2026`,
+      {
+        signal: controller.signal,
+        ttlMs: API_CACHE_TTL.analysis,
+      },
+    )
+      .then((response) => {
         if (!response.ok) {
-          const detail = await response.text()
-          throw new Error(`Environmental analytics request failed (${response.status}): ${detail}`)
+          throw new Error(`Environmental analytics request failed (${response.status}): ${response.detail}`)
         }
-        return (await response.json()) as AnalyticsResponse
+        return response.data
       })
       .then((data) => setAnalyticsData(data))
       .catch((error: unknown) => {
@@ -1366,15 +1447,18 @@ export default function Dashboard() {
       const controller = new AbortController()
       setPrioritiesLoading(true)
       setPrioritiesError(null)
-      fetch(`${API_BASE}/api/v1/priorities/constituencies?season_year=2026`, {
-        signal: controller.signal,
-      })
-        .then(async (response) => {
+      requestJson<PrioritiesResponse>(
+        `${API_BASE}/api/v1/priorities/constituencies?season_year=2026`,
+        {
+          signal: controller.signal,
+          ttlMs: API_CACHE_TTL.analysis,
+        },
+      )
+        .then((response) => {
           if (!response.ok) {
-            const detail = await response.text()
-            throw new Error(`Priority data request failed (${response.status}): ${detail}`)
+            throw new Error(`Priority data request failed (${response.status}): ${response.detail}`)
           }
-          return (await response.json()) as PrioritiesResponse
+          return response.data
         })
         .then((data) => setPrioritiesData(data))
         .catch((error: unknown) => {
@@ -1388,19 +1472,22 @@ export default function Dashboard() {
   }, [active])
 
   useEffect(() => {
+    if (active !== 'predictions') return
     const controller = new AbortController()
     setPredictionStatusLoading(true)
     setPredictionStatusError(null)
-    fetch(
+    requestJson<PredictionStatus>(
       `${API_BASE}/api/v1/predictions/status?region_id=${encodeURIComponent(summaryRegionId)}`,
-      { signal: controller.signal },
+      {
+        signal: controller.signal,
+        ttlMs: API_CACHE_TTL.analysis,
+      },
     )
-      .then(async (response) => {
+      .then((response) => {
         if (!response.ok) {
-          const detail = await response.text()
-          throw new Error(`Prediction readiness request failed (${response.status}): ${detail}`)
+          throw new Error(`Prediction readiness request failed (${response.status}): ${response.detail}`)
         }
-        return (await response.json()) as PredictionStatus
+        return response.data
       })
       .then((data) => setPredictionStatus(data))
       .catch((error: unknown) => {
@@ -1414,7 +1501,7 @@ export default function Dashboard() {
         if (!controller.signal.aborted) setPredictionStatusLoading(false)
       })
     return () => controller.abort()
-  }, [summaryRegionId])
+  }, [active, summaryRegionId])
 
   useEffect(() => {
     if (active !== 'predictions') return
@@ -1423,16 +1510,18 @@ export default function Dashboard() {
     setPredictionEstimateLoading(true)
     setPredictionEstimateError(null)
     setNdviUpliftPercent(0)
-    fetch(
+    requestJson<PredictionEstimate>(
       `${API_BASE}/api/v1/predictions/estimate?region_id=${encodeURIComponent(summaryRegionId)}&season_year=2026`,
-      { signal: controller.signal },
+      {
+        signal: controller.signal,
+        ttlMs: API_CACHE_TTL.analysis,
+      },
     )
-      .then(async (response) => {
+      .then((response) => {
         if (!response.ok) {
-          const detail = await response.text()
-          throw new Error(`Spatial estimate request failed (${response.status}): ${detail}`)
+          throw new Error(`Spatial estimate request failed (${response.status}): ${response.detail}`)
         }
-        return (await response.json()) as PredictionEstimate
+        return response.data
       })
       .then((data) => setPredictionEstimate(data))
       .catch((error: unknown) => {
@@ -1446,19 +1535,22 @@ export default function Dashboard() {
   }, [active, summaryRegionId])
 
   useEffect(() => {
+    if (active !== 'satellite' && active !== 'reports') return
     const controller = new AbortController()
     setSatelliteSummaryLoading(true)
     setSatelliteSummaryError(null)
-    fetch(
+    requestJson<SatelliteAnalysisSummary>(
       `${API_BASE}/api/v1/satellite/summary?region_id=${encodeURIComponent(summaryRegionId)}&season_year=2026`,
-      { signal: controller.signal },
+      {
+        signal: controller.signal,
+        ttlMs: API_CACHE_TTL.analysis,
+      },
     )
-      .then(async (response) => {
+      .then((response) => {
         if (!response.ok) {
-          const detail = await response.text()
-          throw new Error(`Satellite analysis request failed (${response.status}): ${detail}`)
+          throw new Error(`Satellite analysis request failed (${response.status}): ${response.detail}`)
         }
-        return (await response.json()) as SatelliteAnalysisSummary
+        return response.data
       })
       .then((data) => setSatelliteSummary(data))
       .catch((error: unknown) => {
@@ -1472,7 +1564,7 @@ export default function Dashboard() {
         if (!controller.signal.aborted) setSatelliteSummaryLoading(false)
       })
     return () => controller.abort()
-  }, [summaryRegionId])
+  }, [active, summaryRegionId])
 
   return (
     <main className="app-shell">
@@ -2155,27 +2247,10 @@ export default function Dashboard() {
                         />
                       )}
                       <GeoJSON
-                        key={`${region}-${districtCollection.district_count}`}
+                        key="district-boundaries"
                         data={districtCollection.geojson as FeatureCollection}
                         bubblingMouseEvents={false}
-                        style={(feature) => {
-                          const selectedId = region.startsWith('district_') ? region.slice(9) : null
-                          const isSelected = feature?.properties?.district_id === selectedId
-                          const isDimmed = selectedId !== null && !isSelected
-                          return {
-                            color: baseLayer === 'satellite'
-                              ? isSelected ? '#a8fff0' : '#d8fff1'
-                              : isSelected ? '#b7efc7' : '#83d3a0',
-                            weight: isSelected ? (baseLayer === 'satellite' ? 3.5 : 3) : (baseLayer === 'satellite' ? 1.6 : 1),
-                            fillColor: baseLayer === 'satellite'
-                              ? isSelected ? '#00c6a7' : '#22a6a1'
-                              : isSelected ? '#83d3a0' : '#2f7553',
-                            fillOpacity: isDimmed
-                              ? baseLayer === 'satellite' ? 0.025 : 0.06
-                              : isSelected ? baseLayer === 'satellite' ? 0.17 : 0.42
-                              : baseLayer === 'satellite' ? 0.055 : 0.16,
-                          }
-                        }}
+                        style={districtStyle}
                         onEachFeature={(feature, layer) => {
                           const name = feature.properties?.district_name ?? 'District'
                           const source = feature.properties?.source ?? districtCollection.source
@@ -2197,24 +2272,7 @@ export default function Dashboard() {
                           key={`constituencies-${region}`}
                           data={constituencyCollection.geojson}
                           bubblingMouseEvents={false}
-                          style={(feature) => {
-                            const id = feature?.properties?.constituency_id
-                            const selected = id === constituencyId
-                            const dimmed = constituencyId !== null && !selected
-                            return {
-                              color: baseLayer === 'satellite'
-                                ? selected ? '#ffe27a' : '#d2fff0'
-                                : selected ? '#f5cb70' : '#a9e3bb',
-                              weight: selected ? (baseLayer === 'satellite' ? 3.5 : 3) : (baseLayer === 'satellite' ? 1.6 : 1),
-                              fillColor: baseLayer === 'satellite'
-                                ? selected ? '#f1bb3f' : '#55bca0'
-                                : selected ? '#f5cb70' : '#55a879',
-                              fillOpacity: dimmed
-                                ? baseLayer === 'satellite' ? 0.035 : 0.08
-                                : selected ? baseLayer === 'satellite' ? 0.2 : 0.58
-                                : baseLayer === 'satellite' ? 0.07 : 0.26,
-                            }
-                          }}
+                          style={constituencyStyle}
                           onEachFeature={(feature, layer) => {
                             const properties = feature.properties ?? {}
                             const popup = document.createElement('div')
@@ -2250,12 +2308,7 @@ export default function Dashboard() {
                           key={`inspection-cell-${inspection?.cell_id ?? 'unavailable'}`}
                           data={inspectionCellGeojson}
                           interactive={false}
-                          style={{
-                            color: '#f5cb70',
-                            weight: 2,
-                            fillColor: '#f5cb70',
-                            fillOpacity: 0.1,
-                          }}
+                          style={INSPECTION_CELL_STYLE}
                         />
                       )}
                       <MapClickInspector
